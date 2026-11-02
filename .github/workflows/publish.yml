@@ -165,8 +165,17 @@ jobs:
           paths = {"versions": "versioning/versions/version", "release": "versioning/release",
                    "timestamp": "versioning/snapshot/timestamp", "buildNumber": "versioning/snapshot/buildNumber",
                    "values": "versioning/snapshotVersions/snapshotVersion/value"}
-          for element in root.findall(paths[sys.argv[2]]):
-              print((element.text or "").strip())' "$1" "$2"
+          if sys.argv[2] == "newest":
+              # The newest value per (extension, classifier): the registry keeps every build listed.
+              newest = {}
+              for v in root.findall("versioning/snapshotVersions/snapshotVersion"):
+                  key = (v.findtext("extension", "").strip(), v.findtext("classifier", "").strip())
+                  newest[key] = max(newest.get(key, ""), v.findtext("value", "").strip())
+              for key in sorted(newest):
+                  print(newest[key])
+          else:
+              for element in root.findall(paths[sys.argv[2]]):
+                  print((element.text or "").strip())' "$1" "$2"
           }
           expected="$RUNNER_TEMP/expected.txt"
           : > "$expected"
@@ -296,8 +305,17 @@ jobs:
           paths = {"versions": "versioning/versions/version", "release": "versioning/release",
                    "timestamp": "versioning/snapshot/timestamp", "buildNumber": "versioning/snapshot/buildNumber",
                    "values": "versioning/snapshotVersions/snapshotVersion/value"}
-          for element in root.findall(paths[sys.argv[2]]):
-              print((element.text or "").strip())' "$1" "$2"
+          if sys.argv[2] == "newest":
+              # The newest value per (extension, classifier): the registry keeps every build listed.
+              newest = {}
+              for v in root.findall("versioning/snapshotVersions/snapshotVersion"):
+                  key = (v.findtext("extension", "").strip(), v.findtext("classifier", "").strip())
+                  newest[key] = max(newest.get(key, ""), v.findtext("value", "").strip())
+              for key in sorted(newest):
+                  print(newest[key])
+          else:
+              for element in root.findall(paths[sys.argv[2]]):
+                  print((element.text or "").strip())' "$1" "$2"
           }
           metadata="$RUNNER_TEMP/metadata.xml"
           for coordinate in $COORDINATES; do
@@ -316,9 +334,10 @@ jobs:
               timestamp=$(meta "$metadata" timestamp)
               [ "$build" = "$EXPECT_BUILD" ] || { echo "::error::$coordinate build $build, expected $EXPECT_BUILD"; exit 1; }
               value="${VERSION%-SNAPSHOT}-$timestamp-$build"
-              meta "$metadata" values > "$RUNNER_TEMP/values"
+              # Earlier builds stay listed (and their files stay); the newest entry of each file must be this build.
+              meta "$metadata" newest > "$RUNNER_TEMP/values"
               [ -s "$RUNNER_TEMP/values" ] && ! grep -qvxF "$value" "$RUNNER_TEMP/values" \
-                || { echo "::error::$coordinate has snapshotVersions other than $value"; exit 1; }
+                || { echo "::error::$coordinate: the newest snapshotVersions aren't all $value"; cat "$RUNNER_TEMP/values"; exit 1; }
               unique=":$timestamp-$build"
             else
               unique=
