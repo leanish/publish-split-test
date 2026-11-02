@@ -19,7 +19,10 @@ val greet by tasks.registering(JavaExec::class) {
     mainClass.set("consumer.Main")
 }
 
+// The component Gradle resolved: for a SNAPSHOT its display name carries the unique timestamp and build.
 val resolvedFiles by tasks.registering {
-    val files = configurations.runtimeClasspath.map { it.incoming.artifacts.artifacts.map { a -> a.file.name } }
-    doLast { files.get().forEach { logger.lifecycle("resolved: $it") } }
+    val resolved = configurations.runtimeClasspath.map {
+        it.incoming.artifacts.artifacts.map { a -> "${a.id.componentIdentifier.displayName} ${a.file.name}" }
+    }
+    doLast { resolved.get().forEach { logger.lifecycle("resolved: $it") } }
 }

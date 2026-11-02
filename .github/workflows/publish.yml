@@ -11,7 +11,7 @@ on:
         description: "Version to publish (e.g. 0.1.0 or 0.3.0-SNAPSHOT)"
         required: true
       fail_after_artifacts:
-        description: "Test only: stop publish's first attempt after the artifacts, before any metadata"
+        description: "Test only: stop publish's first attempt after 10 uploads, halfway through the files"
         type: boolean
         default: false
       expect_versions:
@@ -69,9 +69,9 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
 
-      # GitHub Packages generates every coordinate's maven-metadata.xml itself (a PUT of one is accepted and ignored),
-      # so that isn't seeded or uploaded. A SNAPSHOT's version metadata is seeded so Gradle continues the remote
-      # build number (Gradle merges a file repository's existing metadata).
+      # GitHub Packages generates all maven-metadata.xml itself from the files uploaded (a PUT of one is accepted and
+      # ignored), so none is uploaded. A SNAPSHOT's version metadata is seeded so Gradle continues the remote build
+      # number (Gradle merges a file repository's existing metadata), and its snapshot (timestamp-build) is recorded.
       - name: Seed a SNAPSHOT's version metadata
         if: endsWith(inputs.version, '-SNAPSHOT')
         env:
@@ -88,7 +88,9 @@ jobs:
             status=$(curl -sS -L --retry 3 -o "$RUNNER_TEMP/seed" -w '%{http_code}' -H @"$auth" "$REGISTRY/$path")
             case "$status" in
               200) mkdir -p "$staging/$(dirname "$path")"; cp "$RUNNER_TEMP/seed" "$staging/$path"; echo "seeded $path"; cat "$staging/$path"
-                   printf '%s %s\n' "$(sha256sum "$staging/$path" | cut -d' ' -f1)" "$path" >> "$RUNNER_TEMP/seeded.txt" ;;
+                   printf '%s %s\n' "$(python3 -I -c 'import sys, xml.etree.ElementTree as ET
+          s = ET.parse(sys.argv[1]).getroot().find("versioning/snapshot")
+          print("%s-%s" % (s.findtext("timestamp").strip(), s.findtext("buildNumber").strip()))' "$staging/$path")" "$path" >> "$RUNNER_TEMP/seeded.txt" ;;
               404) echo "absent $path"; printf 'absent %s\n' "$path" >> "$RUNNER_TEMP/seeded.txt" ;;
               *) echo "::error::GET $path returned $status"; exit 1 ;;
             esac
@@ -187,7 +189,7 @@ jobs:
           done
           diff <(LC_ALL=C sort "$expected") <(cut -d' ' -f3- ../manifest.txt | LC_ALL=C sort) \
             || { echo "::error::the hand-over isn't exactly the expected files (diff above: < missing, > unexpected)"; exit 1; }
-          grep -qvE '^(absent|[0-9a-f]{64}) [^ /][^ ]*$' ../seeded.txt && { echo "::error::malformed seeded line"; exit 1; }
+          grep -qvE '^(absent|[0-9]{8}\.[0-9]{6}-[0-9]+) [^ /][^ ]*$' ../seeded.txt && { echo "::error::malformed seeded line"; exit 1; }
           diff <(grep -E '/maven-metadata\.xml$' "$expected" | LC_ALL=C sort) <(cut -d' ' -f2- ../seeded.txt | LC_ALL=C sort) \
             || { echo "::error::seeded.txt doesn't cover exactly the SNAPSHOT version metadata"; exit 1; }
           echo "hand-over verified: $(wc -l < ../manifest.txt) files"
@@ -217,65 +219,45 @@ jobs:
           }
           is_metadata() { [[ "$1" =~ /maven-metadata\.xml(\.(md5|sha1|sha256|sha512))?$ ]]; }
 
-          # Before writing anything: a SNAPSHOT's version metadata must still be what prepare seeded (a fresh publish)
-          # or prepared (a retry), so an older build can't overwrite a newer one's descriptor. Only checked here:
-          # uploading artifacts may make the registry change it.
-          while read -r hash path; do
+          identity() { python3 -I -c 'import sys, xml.etree.ElementTree as ET
+          s = ET.parse(sys.argv[1]).getroot().find("versioning/snapshot")
+          print("%s-%s" % (s.findtext("timestamp").strip(), s.findtext("buildNumber").strip()))' "$1"; }
+          # Before writing anything: a SNAPSHOT's latest build on the registry must still be the one prepare seeded (a
+          # fresh publish) or this one (a retry), so an older build can't become the latest over a newer one. The
+          # registry rebuilds the XML from the files, so builds are compared, not bytes.
+          while read -r seeded path; do
             status=$(get "$path")
             case "$status" in
-              200) now=$(sha256sum "$remote" | cut -d' ' -f1) ;;
+              200) now=$(identity "$remote") ;;
               404) now=absent ;;
               *) echo "::error::GET $path returned $status"; exit 1 ;;
             esac
-            [ "$now" = "$hash" ] || [ "$now" = "$(sha256sum "$path" | cut -d' ' -f1)" ] \
-              || { echo "::error::$path changed since prepare (now $now, seeded $hash): prepare again"; exit 1; }
+            [ "$now" = "$seeded" ] || [ "$now" = "$(identity "$path")" ] \
+              || { echo "::error::$path is at build $now, seeded $seeded: a newer build exists, prepare again"; exit 1; }
           done < ../seeded.txt
 
           mapfile -t files < <(cut -d' ' -f3- ../manifest.txt)
-          # Artifacts and their checksums are immutable: identical → skip, different → fail, absent → upload.
+          uploaded=0
+          # Artifacts and their checksums are immutable: identical → skip, different → fail, absent → upload. Once
+          # some of a version's files are up, only a re-run of this job with the same artifact completes it: a rebuild
+          # with other bytes is refused here.
           for path in "${files[@]}"; do
             is_metadata "$path" && continue
             status=$(get "$path")
             case "$status" in
               200) cmp -s "$remote" "$path" && { echo "same $path"; continue; }
                    echo "::error::$path already exists with other bytes"; exit 1 ;;
-              404) put "$path" ;;
+              404) put "$path"; uploaded=$((uploaded + 1)) ;;
               *) echo "::error::GET $path returned $status"; exit 1 ;;
             esac
+            # Test hook only (the real repositories don't get it): the first attempt stops halfway, so re-running the
+            # failed job tests the recovery.
+            if [ "$FAIL_AFTER_ARTIFACTS" = true ] && [ "$RUN_ATTEMPT" = 1 ] && [ "$uploaded" -ge 10 ]; then
+              echo "::error::stopping after $uploaded uploads (test input)"; exit 1
+            fi
           done
 
-          # Test hook only (the real repositories don't get it). Once artifacts of a release are up, the version can only
-          # be completed by re-running this job with the same artifact: a rebuild with other bytes is refused above.
-          # Only the first attempt stops, so re-running the failed job tests the recovery.
-          if [ "$FAIL_AFTER_ARTIFACTS" = true ] && [ "$RUN_ATTEMPT" = 1 ]; then
-            echo "::error::stopping before metadata (test input)"; exit 1
-          fi
-
-          # A SNAPSHOT's version metadata last, the XML before its checksums. Experiment: record whether the registry
-          # keeps it or serves its own; a mismatch is logged, not fatal.
-          for xml in $(printf '%s\n' "${files[@]}" | grep -E '/maven-metadata\.xml$' | LC_ALL=C sort); do
-            kept=
-            for path in "$xml" "$xml.md5" "$xml.sha1" "$xml.sha256" "$xml.sha512"; do
-              if [ "$path" != "$xml" ] && [ -z "$kept" ]; then
-                # The registry serves its own XML: our checksums would describe other bytes. Record what it serves.
-                status=$(get "$path"); echo "registry's $path -> $status: $(head -c 200 "$remote")"; continue
-              fi
-              status=$(get "$path")
-              if [ "$status" = 200 ] && cmp -s "$remote" "$path"; then echo "same $path"; kept=1; continue; fi
-              [[ "$status" == 200 || "$status" == 404 ]] || { echo "::error::GET $path returned $status"; exit 1; }
-              echo "before PUT, GET $path -> $status"; if [ "$status" = 200 ]; then cat "$remote"; echo; fi
-              status=$(curl -sS -o "$RUNNER_TEMP/put-body" -w '%{http_code}' -X PUT -H @"$auth" --data-binary @"$path" "$REGISTRY/$path")
-              echo "PUT $path -> $status"
-              [[ "$status" == 2?? ]] || { echo "::error::PUT $path returned $status: $(head -c 500 "$RUNNER_TEMP/put-body")"; exit 1; }
-              status=$(get "$path")
-              case "$status" in
-                200) if cmp -s "$remote" "$path"; then echo "kept $path"; kept=1; else
-                       echo "::warning::the registry serves its own $path:"; cat "$remote"; echo; fi ;;
-                404) echo "::warning::the registry doesn't serve $path after the PUT" ;;
-                *) echo "::error::after PUT, GET $path returned $status"; exit 1 ;;
-              esac
-            done
-          done
+          echo "done; the registry generates the Maven metadata from these files"
 
   verify:
     needs: publish
@@ -334,15 +316,16 @@ jobs:
               timestamp=$(meta "$metadata" timestamp)
               [ "$build" = "$EXPECT_BUILD" ] || { echo "::error::$coordinate build $build, expected $EXPECT_BUILD"; exit 1; }
               value="${VERSION%-SNAPSHOT}-$timestamp-$build"
-              [ -n "$(meta "$metadata" values)" ] && [ -z "$(meta "$metadata" values | grep -vxF "$value")" ] \
+              meta "$metadata" values > "$RUNNER_TEMP/values"
+              [ -s "$RUNNER_TEMP/values" ] && ! grep -qvxF "$value" "$RUNNER_TEMP/values" \
                 || { echo "::error::$coordinate has snapshotVersions other than $value"; exit 1; }
-              file_version="$value"
+              unique=":$timestamp-$build"
             else
-              file_version="$VERSION"
+              unique=
             fi
-            # The library (the first coordinate) is what the consumer must download, under this exact name.
+            # The library (the first coordinate) is what the consumer must resolve, at exactly this build.
             if [ "$coordinate" = "${COORDINATES%% *}" ]; then
-              echo "${coordinate##*/}-$file_version.jar" > "$RUNNER_TEMP/expected-jar"
+              echo "io.github.leanish.test:${coordinate##*/}:$VERSION$unique" > "$RUNNER_TEMP/expected-id"
             fi
           done
 
@@ -353,13 +336,13 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          expected_jar=$(cat "$RUNNER_TEMP/expected-jar")
+          expected_id=$(cat "$RUNNER_TEMP/expected-id")
           for source in gradle pom; do
             echo "== metadata source: $source"
             rm -rf consumer/build consumer/.gradle
             GRADLE_USER_HOME="$RUNNER_TEMP/gradle-home-$source" ./gradlew -p consumer --no-configuration-cache \
               greet resolvedFiles publishSplitHello -PtestVersion="$VERSION" -PmetadataSource="$source" | tee "$RUNNER_TEMP/consumer.log"
-            grep -qxF "resolved: $expected_jar" "$RUNNER_TEMP/consumer.log" || { echo "::error::didn't resolve $expected_jar"; exit 1; }
+            grep -qE "^resolved: ${expected_id//./\\.} " "$RUNNER_TEMP/consumer.log" || { echo "::error::didn't resolve $expected_id"; exit 1; }
             grep -qxF "Hello, consumer" "$RUNNER_TEMP/consumer.log" || { echo "::error::the library didn't run"; exit 1; }
             grep -qxF "publish-split-test plugin applied" "$RUNNER_TEMP/consumer.log" || { echo "::error::the plugin didn't run"; exit 1; }
           done
