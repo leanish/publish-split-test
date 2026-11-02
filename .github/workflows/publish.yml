@@ -1,0 +1,338 @@
+name: publish
+
+# Publishing split from building: `prepare` builds and stages with a read-only token, `publish` uploads exactly the
+# staged files with the write token and runs no Gradle and no repository code, `verify` consumes the result from
+# GitHub Packages. A disposable fixture: the version comes from the dispatch input.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. 0.1.0 or 0.3.0-SNAPSHOT)"
+        required: true
+      fail_after_artifacts:
+        description: "Test only: stop publish's first attempt after the artifacts, before any metadata"
+        type: boolean
+        default: false
+      expect_versions:
+        description: "Test only: every version the coordinate metadata must list after this run, space-separated"
+        required: true
+      expect_release:
+        description: "Test only: the metadata's expected <release> (empty: none)"
+        default: ""
+      expect_build:
+        description: "Test only: a SNAPSHOT's expected build number"
+        default: ""
+
+permissions:
+  contents: read
+
+# Versions share the coordinate-level maven-metadata.xml: one publish at a time per repository.
+concurrency:
+  group: publish-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: https://maven.pkg.github.com/${{ github.repository }}
+  # The coordinates this repository publishes, as staging paths: library, plugin implementation, plugin marker.
+  COORDINATES: >-
+    io/github/leanish/test/publish-split-test
+    io/github/leanish/test/publish-split-test-plugin
+    io/github/leanish/test/publish-split-test/io.github.leanish.test.publish-split-test.gradle.plugin
+  # The files each coordinate must publish, as suffixes after `<artifact>-<version>` (a marker is a POM only).
+  # publish requires exactly these, each with its .md5/.sha1/.sha256/.sha512, and Maven metadata: nothing else.
+  FILES_LIBRARY: .jar -sources.jar -javadoc.jar .pom .module
+  FILES_MARKER: .pom
+
+jobs:
+  prepare:
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      # To read the current remote metadata; Gradle never sees a write token.
+      packages: read
+    steps:
+      - name: Check the version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-SNAPSHOT)?$ ]] || { echo "::error::unexpected version: $VERSION"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+
+      # Gradle merges a file repository's existing maven-metadata.xml, so staging starts from the remote one: earlier
+      # versions stay listed and SNAPSHOT build numbers continue. The base records what was seeded, for publish.
+      - name: Seed staging with the remote metadata
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          staging=build/publication-staging
+          mkdir -p "$staging"
+          : > "$RUNNER_TEMP/base.txt"
+          auth="$RUNNER_TEMP/auth-header"
+          (umask 077; printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" > "$auth")
+          trap 'rm -f "$auth"' EXIT
+          for coordinate in $COORDINATES; do
+            paths=("$coordinate/maven-metadata.xml")
+            [[ "$VERSION" == *-SNAPSHOT ]] && paths+=("$coordinate/$VERSION/maven-metadata.xml")
+            for path in "${paths[@]}"; do
+              status=$(curl -sS -L --retry 3 -o "$RUNNER_TEMP/seed" -w '%{http_code}' -H @"$auth" "$REGISTRY/$path")
+              case "$status" in
+                200)
+                  mkdir -p "$staging/$(dirname "$path")"
+                  cp "$RUNNER_TEMP/seed" "$staging/$path"
+                  printf '%s %s\n' "$(sha256sum "$staging/$path" | cut -d' ' -f1)" "$path" >> "$RUNNER_TEMP/base.txt" ;;
+                404) printf 'absent %s\n' "$path" >> "$RUNNER_TEMP/base.txt" ;;
+                *) echo "::error::GET $path returned $status"; exit 1 ;;
+              esac
+            done
+          done
+          cat "$RUNNER_TEMP/base.txt"
+
+      - name: Build, check and stage
+        env:
+          VERSION: ${{ inputs.version }}
+        run: ./gradlew check publishAllPublicationsToStagingRepository -PpublishVersion="$VERSION"
+
+      - name: Write the manifest and summary
+        env:
+          VERSION: ${{ inputs.version }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          staging=build/publication-staging
+          [ -z "$(find "$staging" -type l)" ] || { echo "::error::staging contains symlinks"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/handover"
+          cp -R "$staging" "$RUNNER_TEMP/handover/files"
+          cp "$RUNNER_TEMP/base.txt" "$RUNNER_TEMP/handover/base.txt"
+          (cd "$RUNNER_TEMP/handover/files" && find . -type f -printf '%P\n' | LC_ALL=C sort | xargs -r -d '\n' sha256sum) > "$RUNNER_TEMP/handover/manifest.txt"
+          {
+            echo "### Prepared $VERSION from $SHA"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/handover/manifest.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: publication
+          path: ${{ runner.temp }}/handover
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: prepare
+    runs-on: ubuntu-26.04
+    # Only the upload: no checkout, no Gradle, no cache; the files come from prepare's artifact.
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: publication
+          path: ${{ runner.temp }}/handover
+
+      - name: Verify the hand-over
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/handover/files"
+          [ -z "$(find . -type l)" ] || { echo "::error::the hand-over contains symlinks"; exit 1; }
+          grep -qvE '^[0-9a-f]{64}  [^ /][^ ]*$' ../manifest.txt && { echo "::error::malformed manifest line"; exit 1; }
+          sha256sum --quiet --strict -c ../manifest.txt
+          # Every file is in the manifest, exactly once.
+          diff <(find . -type f -printf '%P\n' | LC_ALL=C sort) <(cut -d' ' -f3- ../manifest.txt) > /dev/null \
+            || { echo "::error::files and manifest differ"; exit 1; }
+          [ "$(cut -d' ' -f3- ../manifest.txt | sort | uniq -d)" = "" ] || { echo "::error::duplicate paths"; exit 1; }
+          # The exact set this version must publish, built from the coordinates (not from what was handed over): a
+          # missing publication or an extra path fails. A SNAPSHOT's file version comes from its version metadata.
+          expected="$RUNNER_TEMP/expected.txt"
+          : > "$expected"
+          with_sidecars() { for suffix in "" .md5 .sha1 .sha256 .sha512; do printf '%s%s\n' "$1" "$suffix" >> "$expected"; done; }
+          for coordinate in $COORDINATES; do
+            artifact="${coordinate##*/}"
+            files="$FILES_LIBRARY"
+            [[ "$artifact" == *.gradle.plugin ]] && files="$FILES_MARKER"
+            with_sidecars "$coordinate/maven-metadata.xml"
+            file_version="$VERSION"
+            if [[ "$VERSION" == *-SNAPSHOT ]]; then
+              metadata="$coordinate/$VERSION/maven-metadata.xml"
+              [ -f "$metadata" ] || { echo "::error::missing $metadata"; exit 1; }
+              timestamp=$(sed -n 's|.*<timestamp>\([0-9]\{8\}\.[0-9]\{6\}\)</timestamp>.*|\1|p' "$metadata")
+              build=$(sed -n 's|.*<buildNumber>\([0-9]\{1,\}\)</buildNumber>.*|\1|p' "$metadata")
+              [ -n "$timestamp" ] && [ -n "$build" ] || { echo "::error::no snapshot timestamp in $metadata"; exit 1; }
+              file_version="${VERSION%-SNAPSHOT}-$timestamp-$build"
+              with_sidecars "$metadata"
+            fi
+            for suffix in $files; do with_sidecars "$coordinate/$VERSION/$artifact-$file_version$suffix"; done
+          done
+          diff <(LC_ALL=C sort "$expected") <(cut -d' ' -f3- ../manifest.txt | LC_ALL=C sort) \
+            || { echo "::error::the hand-over isn't exactly the expected files (diff above: < missing, > unexpected)"; exit 1; }
+          # base.txt names exactly the metadata files prepare seeded (or found absent), so every one gets checked.
+          grep -qvE '^(absent|[0-9a-f]{64}) [^ /][^ ]*$' ../base.txt && { echo "::error::malformed base line"; exit 1; }
+          diff <(grep -E '/maven-metadata\.xml$' "$expected" | LC_ALL=C sort) <(cut -d' ' -f2- ../base.txt | LC_ALL=C sort) \
+            || { echo "::error::base.txt doesn't cover exactly the metadata files"; exit 1; }
+          echo "hand-over verified: $(wc -l < ../manifest.txt) files"
+
+      - name: Upload
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FAIL_AFTER_ARTIFACTS: ${{ inputs.fail_after_artifacts }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/handover/files"
+          auth="$RUNNER_TEMP/auth-header"
+          (umask 077; printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" > "$auth")
+          trap 'rm -f "$auth"' EXIT
+          remote="$RUNNER_TEMP/remote"
+          # GET follows redirects (downloads may be served from storage; curl drops the header on another host).
+          # PUTs aren't retried (a re-run of this job with the same artifact recovers).
+          get() { curl -sS -L --retry 3 -o "$remote" -w '%{http_code}' -H @"$auth" "$REGISTRY/$1"; }
+          put() {
+            local status
+            status=$(curl -sS -o "$RUNNER_TEMP/put-body" -w '%{http_code}' -X PUT -H @"$auth" --data-binary @"$1" "$REGISTRY/$1")
+            echo "PUT $1 -> $status"
+            [[ "$status" == 2?? ]] || { echo "::error::PUT $1 returned $status: $(head -c 500 "$RUNNER_TEMP/put-body")"; exit 1; }
+            status=$(get "$1")
+            [ "$status" = 200 ] && cmp -s "$remote" "$1" || { echo "::error::after PUT, GET $1 returned $status or other bytes"; exit 1; }
+          }
+          is_metadata() { [[ "$1" =~ /maven-metadata\.xml(\.(md5|sha1|sha256|sha512))?$ ]]; }
+
+          # The remote metadata must still be what prepare seeded (a fresh publish) or what it prepared (a retry):
+          # checked before writing anything and again right before the metadata. Only this workflow is serialized;
+          # another writer between the last check and the PUTs isn't caught.
+          check_metadata_base() {
+            local hash path status now prepared
+            while read -r hash path; do
+              status=$(get "$path")
+              case "$status" in
+                200) now=$(sha256sum "$remote" | cut -d' ' -f1) ;;
+                404) now=absent ;;
+                *) echo "::error::GET $path returned $status"; exit 1 ;;
+              esac
+              prepared=$(sha256sum "$path" | cut -d' ' -f1)
+              [ "$now" = "$hash" ] || [ "$now" = "$prepared" ] \
+                || { echo "::error::$path changed since prepare (now $now, seeded $hash): prepare again"; exit 1; }
+            done < ../base.txt
+          }
+          check_metadata_base
+
+          mapfile -t files < <(cut -d' ' -f3- ../manifest.txt)
+          # Artifacts and their checksums are immutable: identical → skip, different → fail, absent → upload.
+          for path in "${files[@]}"; do
+            is_metadata "$path" && continue
+            status=$(get "$path")
+            case "$status" in
+              200) cmp -s "$remote" "$path" && { echo "same $path"; continue; }
+                   echo "::error::$path already exists with other bytes"; exit 1 ;;
+              404) put "$path" ;;
+              *) echo "::error::GET $path returned $status"; exit 1 ;;
+            esac
+          done
+
+          # Test hook only (the real repositories don't get it). Once artifacts of a release are up, the version can only
+          # be completed by re-running this job with the same artifact: a rebuild with other bytes is refused above.
+          # Only the first attempt stops, so re-running the failed job tests the recovery.
+          if [ "$FAIL_AFTER_ARTIFACTS" = true ] && [ "$RUN_ATTEMPT" = 1 ]; then
+            echo "::error::stopping before metadata (test input)"; exit 1
+          fi
+
+          check_metadata_base
+          # Metadata last: the XML before its checksums, version-level before coordinate-level.
+          for path in $(printf '%s\n' "${files[@]}" | grep -E '/maven-metadata\.xml' | awk -F/ '{ print NF, $0 }' | sort -k1,1nr -k2 | cut -d' ' -f2-); do
+            status=$(get "$path")
+            if [ "$status" = 200 ] && cmp -s "$remote" "$path"; then echo "same $path"; continue; fi
+            [[ "$status" == 200 || "$status" == 404 ]] || { echo "::error::GET $path returned $status"; exit 1; }
+            put "$path"
+          done
+
+  verify:
+    needs: publish
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 25
+
+      # The remote metadata must list exactly the expected versions (none lost), the expected release, and for a
+      # SNAPSHOT the expected build number, with every snapshotVersion pointing at that build.
+      - name: Check the remote metadata
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          EXPECT_VERSIONS: ${{ inputs.expect_versions }}
+          EXPECT_RELEASE: ${{ inputs.expect_release }}
+          EXPECT_BUILD: ${{ inputs.expect_build }}
+        run: |
+          set -euo pipefail
+          auth="$RUNNER_TEMP/auth-header"
+          (umask 077; printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" > "$auth")
+          trap 'rm -f "$auth"' EXIT
+          metadata="$RUNNER_TEMP/metadata.xml"
+          for coordinate in $COORDINATES; do
+            echo "== $coordinate"
+            curl -sS -L -f --retry 3 -H @"$auth" -o "$metadata" "$REGISTRY/$coordinate/maven-metadata.xml"
+            cat "$metadata"
+            listed=$(sed -n 's|.*<version>\(.*\)</version>.*|\1|p' "$metadata" | LC_ALL=C sort | tr '\n' ' ')
+            wanted=$(printf '%s\n' $EXPECT_VERSIONS | LC_ALL=C sort | tr '\n' ' ')
+            [ "$listed" = "$wanted" ] || { echo "::error::$coordinate lists [$listed], expected [$wanted]"; exit 1; }
+            release=$(sed -n 's|.*<release>\(.*\)</release>.*|\1|p' "$metadata")
+            [ "$release" = "$EXPECT_RELEASE" ] || { echo "::error::$coordinate release is '$release', expected '$EXPECT_RELEASE'"; exit 1; }
+            if [[ "$VERSION" == *-SNAPSHOT ]]; then
+              curl -sS -L -f --retry 3 -H @"$auth" -o "$metadata" "$REGISTRY/$coordinate/$VERSION/maven-metadata.xml"
+              cat "$metadata"
+              build=$(sed -n 's|.*<buildNumber>\([0-9]*\)</buildNumber>.*|\1|p' "$metadata")
+              timestamp=$(sed -n 's|.*<timestamp>\([0-9.]*\)</timestamp>.*|\1|p' "$metadata")
+              [ "$build" = "$EXPECT_BUILD" ] || { echo "::error::$coordinate build $build, expected $EXPECT_BUILD"; exit 1; }
+              value="${VERSION%-SNAPSHOT}-$timestamp-$build"
+              [ -z "$(sed -n 's|.*<value>\(.*\)</value>.*|\1|p' "$metadata" | grep -vxF "$value")" ] \
+                || { echo "::error::$coordinate has snapshotVersions other than $value"; exit 1; }
+              file_version="$value"
+            else
+              file_version="$VERSION"
+            fi
+            # The library (the first coordinate) is what the consumer must download, under this exact name.
+            if [ "$coordinate" = "${COORDINATES%% *}" ]; then
+              echo "${coordinate##*/}-$file_version.jar" > "$RUNNER_TEMP/expected-jar"
+            fi
+          done
+
+      # Each metadata source from scratch: its own Gradle home, no cache, a clean consumer.
+      - name: Consume the published version
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          expected_jar=$(cat "$RUNNER_TEMP/expected-jar")
+          for source in gradle pom; do
+            echo "== metadata source: $source"
+            rm -rf consumer/build consumer/.gradle
+            GRADLE_USER_HOME="$RUNNER_TEMP/gradle-home-$source" ./gradlew -p consumer --no-configuration-cache \
+              greet resolvedFiles publishSplitHello -PtestVersion="$VERSION" -PmetadataSource="$source" | tee "$RUNNER_TEMP/consumer.log"
+            grep -qxF "resolved: $expected_jar" "$RUNNER_TEMP/consumer.log" || { echo "::error::didn't resolve $expected_jar"; exit 1; }
+            grep -qxF "Hello, consumer" "$RUNNER_TEMP/consumer.log" || { echo "::error::the library didn't run"; exit 1; }
+            grep -qxF "publish-split-test plugin applied" "$RUNNER_TEMP/consumer.log" || { echo "::error::the plugin didn't run"; exit 1; }
+          done
