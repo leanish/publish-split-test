@@ -87,8 +87,9 @@ jobs:
             path="$coordinate/$VERSION/maven-metadata.xml"
             status=$(curl -sS -L --retry 3 -o "$RUNNER_TEMP/seed" -w '%{http_code}' -H @"$auth" "$REGISTRY/$path")
             case "$status" in
-              200) mkdir -p "$staging/$(dirname "$path")"; cp "$RUNNER_TEMP/seed" "$staging/$path"; echo "seeded $path"; cat "$staging/$path" ;;
-              404) echo "absent $path" ;;
+              200) mkdir -p "$staging/$(dirname "$path")"; cp "$RUNNER_TEMP/seed" "$staging/$path"; echo "seeded $path"; cat "$staging/$path"
+                   printf '%s %s\n' "$(sha256sum "$staging/$path" | cut -d' ' -f1)" "$path" >> "$RUNNER_TEMP/seeded.txt" ;;
+              404) echo "absent $path"; printf 'absent %s\n' "$path" >> "$RUNNER_TEMP/seeded.txt" ;;
               *) echo "::error::GET $path returned $status"; exit 1 ;;
             esac
           done
@@ -110,6 +111,8 @@ jobs:
           for coordinate in $COORDINATES; do rm -f "$staging/$coordinate"/maven-metadata.xml*; done
           mkdir -p "$RUNNER_TEMP/handover"
           cp -R "$staging" "$RUNNER_TEMP/handover/files"
+          touch "$RUNNER_TEMP/seeded.txt"
+          cp "$RUNNER_TEMP/seeded.txt" "$RUNNER_TEMP/handover/seeded.txt"
           (cd "$RUNNER_TEMP/handover/files" && find . -type f -printf '%P\n' | LC_ALL=C sort | xargs -r -d '\n' sha256sum) > "$RUNNER_TEMP/handover/manifest.txt"
           {
             echo "### Prepared $VERSION from $SHA"
@@ -153,6 +156,16 @@ jobs:
           [ "$(cut -d' ' -f3- ../manifest.txt | sort | uniq -d)" = "" ] || { echo "::error::duplicate paths"; exit 1; }
           # The exact set this version must publish, built from the coordinates (not from what was handed over): a
           # missing publication or an extra path fails. A SNAPSHOT's file version comes from its version metadata.
+          # Reads a Maven metadata field with an XML parser (the registry serves the XML on one line).
+          meta() {
+            python3 -I -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          paths = {"versions": "versioning/versions/version", "release": "versioning/release",
+                   "timestamp": "versioning/snapshot/timestamp", "buildNumber": "versioning/snapshot/buildNumber",
+                   "values": "versioning/snapshotVersions/snapshotVersion/value"}
+          for element in root.findall(paths[sys.argv[2]]):
+              print((element.text or "").strip())' "$1" "$2"
+          }
           expected="$RUNNER_TEMP/expected.txt"
           : > "$expected"
           with_sidecars() { for suffix in "" .md5 .sha1 .sha256 .sha512; do printf '%s%s\n' "$1" "$suffix" >> "$expected"; done; }
@@ -164,9 +177,9 @@ jobs:
             if [[ "$VERSION" == *-SNAPSHOT ]]; then
               metadata="$coordinate/$VERSION/maven-metadata.xml"
               [ -f "$metadata" ] || { echo "::error::missing $metadata"; exit 1; }
-              timestamp=$(sed -n 's|.*<timestamp>\([0-9]\{8\}\.[0-9]\{6\}\)</timestamp>.*|\1|p' "$metadata")
-              build=$(sed -n 's|.*<buildNumber>\([0-9]\{1,\}\)</buildNumber>.*|\1|p' "$metadata")
-              [ -n "$timestamp" ] && [ -n "$build" ] || { echo "::error::no snapshot timestamp in $metadata"; exit 1; }
+              timestamp=$(meta "$metadata" timestamp)
+              build=$(meta "$metadata" buildNumber)
+              [[ "$timestamp" =~ ^[0-9]{8}\.[0-9]{6}$ && "$build" =~ ^[0-9]+$ ]] || { echo "::error::no snapshot timestamp in $metadata"; exit 1; }
               file_version="${VERSION%-SNAPSHOT}-$timestamp-$build"
               with_sidecars "$metadata"
             fi
@@ -174,6 +187,9 @@ jobs:
           done
           diff <(LC_ALL=C sort "$expected") <(cut -d' ' -f3- ../manifest.txt | LC_ALL=C sort) \
             || { echo "::error::the hand-over isn't exactly the expected files (diff above: < missing, > unexpected)"; exit 1; }
+          grep -qvE '^(absent|[0-9a-f]{64}) [^ /][^ ]*$' ../seeded.txt && { echo "::error::malformed seeded line"; exit 1; }
+          diff <(grep -E '/maven-metadata\.xml$' "$expected" | LC_ALL=C sort) <(cut -d' ' -f2- ../seeded.txt | LC_ALL=C sort) \
+            || { echo "::error::seeded.txt doesn't cover exactly the SNAPSHOT version metadata"; exit 1; }
           echo "hand-over verified: $(wc -l < ../manifest.txt) files"
 
       - name: Upload
@@ -201,6 +217,20 @@ jobs:
           }
           is_metadata() { [[ "$1" =~ /maven-metadata\.xml(\.(md5|sha1|sha256|sha512))?$ ]]; }
 
+          # Before writing anything: a SNAPSHOT's version metadata must still be what prepare seeded (a fresh publish)
+          # or prepared (a retry), so an older build can't overwrite a newer one's descriptor. Only checked here:
+          # uploading artifacts may make the registry change it.
+          while read -r hash path; do
+            status=$(get "$path")
+            case "$status" in
+              200) now=$(sha256sum "$remote" | cut -d' ' -f1) ;;
+              404) now=absent ;;
+              *) echo "::error::GET $path returned $status"; exit 1 ;;
+            esac
+            [ "$now" = "$hash" ] || [ "$now" = "$(sha256sum "$path" | cut -d' ' -f1)" ] \
+              || { echo "::error::$path changed since prepare (now $now, seeded $hash): prepare again"; exit 1; }
+          done < ../seeded.txt
+
           mapfile -t files < <(cut -d' ' -f3- ../manifest.txt)
           # Artifacts and their checksums are immutable: identical → skip, different → fail, absent → upload.
           for path in "${files[@]}"; do
@@ -223,18 +253,28 @@ jobs:
 
           # A SNAPSHOT's version metadata last, the XML before its checksums. Experiment: record whether the registry
           # keeps it or serves its own; a mismatch is logged, not fatal.
-          for path in $(printf '%s\n' "${files[@]}" | grep -E '/maven-metadata\.xml' | LC_ALL=C sort); do
-            status=$(get "$path")
-            if [ "$status" = 200 ] && cmp -s "$remote" "$path"; then echo "same $path"; continue; fi
-            [[ "$status" == 200 || "$status" == 404 ]] || { echo "::error::GET $path returned $status"; exit 1; }
-            echo "before PUT, GET $path -> $status:"; [ "$status" = 200 ] && cat "$remote" && echo
-            status=$(curl -sS -o "$RUNNER_TEMP/put-body" -w '%{http_code}' -X PUT -H @"$auth" --data-binary @"$path" "$REGISTRY/$path")
-            echo "PUT $path -> $status"
-            [[ "$status" == 2?? ]] || { echo "::error::PUT $path returned $status: $(head -c 500 "$RUNNER_TEMP/put-body")"; exit 1; }
-            status=$(get "$path")
-            if [ "$status" = 200 ] && cmp -s "$remote" "$path"; then echo "kept $path"; else
-              echo "::warning::the registry serves its own $path ($status):"; cat "$remote"; echo
-            fi
+          for xml in $(printf '%s\n' "${files[@]}" | grep -E '/maven-metadata\.xml$' | LC_ALL=C sort); do
+            kept=
+            for path in "$xml" "$xml.md5" "$xml.sha1" "$xml.sha256" "$xml.sha512"; do
+              if [ "$path" != "$xml" ] && [ -z "$kept" ]; then
+                # The registry serves its own XML: our checksums would describe other bytes. Record what it serves.
+                status=$(get "$path"); echo "registry's $path -> $status: $(head -c 200 "$remote")"; continue
+              fi
+              status=$(get "$path")
+              if [ "$status" = 200 ] && cmp -s "$remote" "$path"; then echo "same $path"; kept=1; continue; fi
+              [[ "$status" == 200 || "$status" == 404 ]] || { echo "::error::GET $path returned $status"; exit 1; }
+              echo "before PUT, GET $path -> $status"; if [ "$status" = 200 ]; then cat "$remote"; echo; fi
+              status=$(curl -sS -o "$RUNNER_TEMP/put-body" -w '%{http_code}' -X PUT -H @"$auth" --data-binary @"$path" "$REGISTRY/$path")
+              echo "PUT $path -> $status"
+              [[ "$status" == 2?? ]] || { echo "::error::PUT $path returned $status: $(head -c 500 "$RUNNER_TEMP/put-body")"; exit 1; }
+              status=$(get "$path")
+              case "$status" in
+                200) if cmp -s "$remote" "$path"; then echo "kept $path"; kept=1; else
+                       echo "::warning::the registry serves its own $path:"; cat "$remote"; echo; fi ;;
+                404) echo "::warning::the registry doesn't serve $path after the PUT" ;;
+                *) echo "::error::after PUT, GET $path returned $status"; exit 1 ;;
+              esac
+            done
           done
 
   verify:
@@ -267,24 +307,34 @@ jobs:
           auth="$RUNNER_TEMP/auth-header"
           (umask 077; printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" > "$auth")
           trap 'rm -f "$auth"' EXIT
+          # Reads a Maven metadata field with an XML parser (the registry serves the XML on one line).
+          meta() {
+            python3 -I -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          paths = {"versions": "versioning/versions/version", "release": "versioning/release",
+                   "timestamp": "versioning/snapshot/timestamp", "buildNumber": "versioning/snapshot/buildNumber",
+                   "values": "versioning/snapshotVersions/snapshotVersion/value"}
+          for element in root.findall(paths[sys.argv[2]]):
+              print((element.text or "").strip())' "$1" "$2"
+          }
           metadata="$RUNNER_TEMP/metadata.xml"
           for coordinate in $COORDINATES; do
             echo "== $coordinate"
             curl -sS -L -f --retry 3 -H @"$auth" -o "$metadata" "$REGISTRY/$coordinate/maven-metadata.xml"
             cat "$metadata"
-            listed=$(sed -n 's|.*<version>\(.*\)</version>.*|\1|p' "$metadata" | LC_ALL=C sort | tr '\n' ' ')
+            listed=$(meta "$metadata" versions | LC_ALL=C sort | tr '\n' ' ')
             wanted=$(printf '%s\n' $EXPECT_VERSIONS | LC_ALL=C sort | tr '\n' ' ')
             [ "$listed" = "$wanted" ] || { echo "::error::$coordinate lists [$listed], expected [$wanted]"; exit 1; }
-            release=$(sed -n 's|.*<release>\(.*\)</release>.*|\1|p' "$metadata")
+            release=$(meta "$metadata" release)
             [ "$release" = "$EXPECT_RELEASE" ] || { echo "::error::$coordinate release is '$release', expected '$EXPECT_RELEASE'"; exit 1; }
             if [[ "$VERSION" == *-SNAPSHOT ]]; then
               curl -sS -L -f --retry 3 -H @"$auth" -o "$metadata" "$REGISTRY/$coordinate/$VERSION/maven-metadata.xml"
               cat "$metadata"
-              build=$(sed -n 's|.*<buildNumber>\([0-9]*\)</buildNumber>.*|\1|p' "$metadata")
-              timestamp=$(sed -n 's|.*<timestamp>\([0-9.]*\)</timestamp>.*|\1|p' "$metadata")
+              build=$(meta "$metadata" buildNumber)
+              timestamp=$(meta "$metadata" timestamp)
               [ "$build" = "$EXPECT_BUILD" ] || { echo "::error::$coordinate build $build, expected $EXPECT_BUILD"; exit 1; }
               value="${VERSION%-SNAPSHOT}-$timestamp-$build"
-              [ -z "$(sed -n 's|.*<value>\(.*\)</value>.*|\1|p' "$metadata" | grep -vxF "$value")" ] \
+              [ -n "$(meta "$metadata" values)" ] && [ -z "$(meta "$metadata" values | grep -vxF "$value")" ] \
                 || { echo "::error::$coordinate has snapshotVersions other than $value"; exit 1; }
               file_version="$value"
             else
