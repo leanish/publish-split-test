@@ -69,36 +69,29 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
 
-      # Gradle merges a file repository's existing maven-metadata.xml, so staging starts from the remote one: earlier
-      # versions stay listed and SNAPSHOT build numbers continue. The base records what was seeded, for publish.
-      - name: Seed staging with the remote metadata
+      # GitHub Packages generates every coordinate's maven-metadata.xml itself (a PUT of one is accepted and ignored),
+      # so that isn't seeded or uploaded. A SNAPSHOT's version metadata is seeded so Gradle continues the remote
+      # build number (Gradle merges a file repository's existing metadata).
+      - name: Seed a SNAPSHOT's version metadata
+        if: endsWith(inputs.version, '-SNAPSHOT')
         env:
           GITHUB_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           staging=build/publication-staging
-          mkdir -p "$staging"
-          : > "$RUNNER_TEMP/base.txt"
           auth="$RUNNER_TEMP/auth-header"
           (umask 077; printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" > "$auth")
           trap 'rm -f "$auth"' EXIT
           for coordinate in $COORDINATES; do
-            paths=("$coordinate/maven-metadata.xml")
-            [[ "$VERSION" == *-SNAPSHOT ]] && paths+=("$coordinate/$VERSION/maven-metadata.xml")
-            for path in "${paths[@]}"; do
-              status=$(curl -sS -L --retry 3 -o "$RUNNER_TEMP/seed" -w '%{http_code}' -H @"$auth" "$REGISTRY/$path")
-              case "$status" in
-                200)
-                  mkdir -p "$staging/$(dirname "$path")"
-                  cp "$RUNNER_TEMP/seed" "$staging/$path"
-                  printf '%s %s\n' "$(sha256sum "$staging/$path" | cut -d' ' -f1)" "$path" >> "$RUNNER_TEMP/base.txt" ;;
-                404) printf 'absent %s\n' "$path" >> "$RUNNER_TEMP/base.txt" ;;
-                *) echo "::error::GET $path returned $status"; exit 1 ;;
-              esac
-            done
+            path="$coordinate/$VERSION/maven-metadata.xml"
+            status=$(curl -sS -L --retry 3 -o "$RUNNER_TEMP/seed" -w '%{http_code}' -H @"$auth" "$REGISTRY/$path")
+            case "$status" in
+              200) mkdir -p "$staging/$(dirname "$path")"; cp "$RUNNER_TEMP/seed" "$staging/$path"; echo "seeded $path"; cat "$staging/$path" ;;
+              404) echo "absent $path" ;;
+              *) echo "::error::GET $path returned $status"; exit 1 ;;
+            esac
           done
-          cat "$RUNNER_TEMP/base.txt"
 
       - name: Build, check and stage
         env:
@@ -113,9 +106,10 @@ jobs:
           set -euo pipefail
           staging=build/publication-staging
           [ -z "$(find "$staging" -type l)" ] || { echo "::error::staging contains symlinks"; exit 1; }
+          # The registry generates coordinate metadata itself: Gradle's local copy isn't handed over.
+          for coordinate in $COORDINATES; do rm -f "$staging/$coordinate"/maven-metadata.xml*; done
           mkdir -p "$RUNNER_TEMP/handover"
           cp -R "$staging" "$RUNNER_TEMP/handover/files"
-          cp "$RUNNER_TEMP/base.txt" "$RUNNER_TEMP/handover/base.txt"
           (cd "$RUNNER_TEMP/handover/files" && find . -type f -printf '%P\n' | LC_ALL=C sort | xargs -r -d '\n' sha256sum) > "$RUNNER_TEMP/handover/manifest.txt"
           {
             echo "### Prepared $VERSION from $SHA"
@@ -166,7 +160,6 @@ jobs:
             artifact="${coordinate##*/}"
             files="$FILES_LIBRARY"
             [[ "$artifact" == *.gradle.plugin ]] && files="$FILES_MARKER"
-            with_sidecars "$coordinate/maven-metadata.xml"
             file_version="$VERSION"
             if [[ "$VERSION" == *-SNAPSHOT ]]; then
               metadata="$coordinate/$VERSION/maven-metadata.xml"
@@ -181,10 +174,6 @@ jobs:
           done
           diff <(LC_ALL=C sort "$expected") <(cut -d' ' -f3- ../manifest.txt | LC_ALL=C sort) \
             || { echo "::error::the hand-over isn't exactly the expected files (diff above: < missing, > unexpected)"; exit 1; }
-          # base.txt names exactly the metadata files prepare seeded (or found absent), so every one gets checked.
-          grep -qvE '^(absent|[0-9a-f]{64}) [^ /][^ ]*$' ../base.txt && { echo "::error::malformed base line"; exit 1; }
-          diff <(grep -E '/maven-metadata\.xml$' "$expected" | LC_ALL=C sort) <(cut -d' ' -f2- ../base.txt | LC_ALL=C sort) \
-            || { echo "::error::base.txt doesn't cover exactly the metadata files"; exit 1; }
           echo "hand-over verified: $(wc -l < ../manifest.txt) files"
 
       - name: Upload
@@ -212,25 +201,6 @@ jobs:
           }
           is_metadata() { [[ "$1" =~ /maven-metadata\.xml(\.(md5|sha1|sha256|sha512))?$ ]]; }
 
-          # The remote metadata must still be what prepare seeded (a fresh publish) or what it prepared (a retry):
-          # checked before writing anything and again right before the metadata. Only this workflow is serialized;
-          # another writer between the last check and the PUTs isn't caught.
-          check_metadata_base() {
-            local hash path status now prepared
-            while read -r hash path; do
-              status=$(get "$path")
-              case "$status" in
-                200) now=$(sha256sum "$remote" | cut -d' ' -f1) ;;
-                404) now=absent ;;
-                *) echo "::error::GET $path returned $status"; exit 1 ;;
-              esac
-              prepared=$(sha256sum "$path" | cut -d' ' -f1)
-              [ "$now" = "$hash" ] || [ "$now" = "$prepared" ] \
-                || { echo "::error::$path changed since prepare (now $now, seeded $hash): prepare again"; exit 1; }
-            done < ../base.txt
-          }
-          check_metadata_base
-
           mapfile -t files < <(cut -d' ' -f3- ../manifest.txt)
           # Artifacts and their checksums are immutable: identical → skip, different → fail, absent → upload.
           for path in "${files[@]}"; do
@@ -251,13 +221,20 @@ jobs:
             echo "::error::stopping before metadata (test input)"; exit 1
           fi
 
-          check_metadata_base
-          # Metadata last: the XML before its checksums, version-level before coordinate-level.
-          for path in $(printf '%s\n' "${files[@]}" | grep -E '/maven-metadata\.xml' | awk -F/ '{ print NF, $0 }' | sort -k1,1nr -k2 | cut -d' ' -f2-); do
+          # A SNAPSHOT's version metadata last, the XML before its checksums. Experiment: record whether the registry
+          # keeps it or serves its own; a mismatch is logged, not fatal.
+          for path in $(printf '%s\n' "${files[@]}" | grep -E '/maven-metadata\.xml' | LC_ALL=C sort); do
             status=$(get "$path")
             if [ "$status" = 200 ] && cmp -s "$remote" "$path"; then echo "same $path"; continue; fi
             [[ "$status" == 200 || "$status" == 404 ]] || { echo "::error::GET $path returned $status"; exit 1; }
-            put "$path"
+            echo "before PUT, GET $path -> $status:"; [ "$status" = 200 ] && cat "$remote" && echo
+            status=$(curl -sS -o "$RUNNER_TEMP/put-body" -w '%{http_code}' -X PUT -H @"$auth" --data-binary @"$path" "$REGISTRY/$path")
+            echo "PUT $path -> $status"
+            [[ "$status" == 2?? ]] || { echo "::error::PUT $path returned $status: $(head -c 500 "$RUNNER_TEMP/put-body")"; exit 1; }
+            status=$(get "$path")
+            if [ "$status" = 200 ] && cmp -s "$remote" "$path"; then echo "kept $path"; else
+              echo "::warning::the registry serves its own $path ($status):"; cat "$remote"; echo
+            fi
           done
 
   verify:
