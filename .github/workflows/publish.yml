@@ -24,3 +24,6 @@ jobs:
         io/github/leanish/test/publish-split-test
         io/github/leanish/test/publish-split-test-plugin
         io/github/leanish/test/publish-split-test/io.github.leanish.test.publish-split-test.gradle.plugin
+      java-versions: |
+        17
+        25
