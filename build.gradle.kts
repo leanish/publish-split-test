@@ -1,12 +1,12 @@
 // A disposable fixture for testing a publishing workflow that never runs Gradle with a write token: both projects
-// publish to a shared file repository (`Staging`), which a separate job uploads to GitHub Packages.
+// publish to a shared file repository (`Staging`), which a separate job uploads to GitHub Packages. The version is
+// the root project's (gradle.properties), as the reusable workflow reads it.
 
-val publishVersion = providers.gradleProperty("publishVersion").orElse("0.0.0-SNAPSHOT")
 val stagingDir = layout.buildDirectory.dir("publication-staging")
 
 subprojects {
     group = "io.github.leanish.test"
-    version = publishVersion.get()
+    version = rootProject.version
 
     plugins.withId("maven-publish") {
         extensions.configure<PublishingExtension> {
