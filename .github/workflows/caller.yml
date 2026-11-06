@@ -1,0 +1,7 @@
+name: caller-of-linked-reusable
+on:
+  push:
+    branches: ["symlink-probe-*"]
+jobs:
+  call:
+    uses: ./.github/workflows/reusable-link.yml

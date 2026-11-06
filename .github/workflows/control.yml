@@ -1,0 +1,9 @@
+name: control-plain
+on:
+  push:
+    branches: ["symlink-probe-*"]
+jobs:
+  echo:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "plain control ran"

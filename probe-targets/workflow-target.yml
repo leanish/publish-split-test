@@ -1,0 +1,9 @@
+name: linked-workflow-ran
+on:
+  push:
+    branches: ["symlink-probe-*"]
+jobs:
+  echo:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "workflow behind a link ran"

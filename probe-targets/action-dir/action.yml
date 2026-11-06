@@ -1,0 +1,7 @@
+name: linked action
+description: probe
+runs:
+  using: composite
+  steps:
+    - run: echo "action behind a link ran"
+      shell: bash
